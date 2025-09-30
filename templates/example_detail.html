@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Example {{ example_id }} - DreamPRM MinIF2F</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        .step-card { margin-bottom: 15px; }
+        .step-content { white-space: pre-wrap; }
+        .reward-circle {
+            width: 40px;
+            height: 40px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-weight: bold;
+        }
+    </style>
+</head>
+<body>
+    <nav class="navbar navbar-dark bg-dark">
+        <div class="container">
+            <a class="navbar-brand" href="/">← Back to Dataset</a>
+            <span class="navbar-text">Example {{ example_id }}</span>
+        </div>
+    </nav>
+
+    <div class="container mt-4">
+        <div id="example-detail">
+            <!-- Example details will be loaded here -->
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        function getRewardColor(reward) {
+            if (reward >= 0.8) return '#28a745';
+            if (reward >= 0.6) return '#ffc107';
+            if (reward >= 0.4) return '#fd7e14';
+            return '#dc3545';
+        }
+
+        fetch(`/api/example/{{ example_id }}`)
+            .then(response => response.json())
+            .then(example => {
+                const container = document.getElementById('example-detail');
+                
+                let html = `
+                    <div class="row">
+                        <div class="col-md-8">
+                            <div class="card">
+                                <div class="card-header">
+                                    <h5>Problem Statement</h5>
+                                </div>
+                                <div class="card-body">
+                                    <h6>Informal:</h6>
+                                    <p>${example.informal_prefix}</p>
+                                    <h6>Formal:</h6>
+                                    <p class="font-monospace">${example.formal_statement}</p>
+                                </div>
+                            </div>
+
+                            <div class="card mt-3">
+                                <div class="card-header">
+                                    <h5>Chain of Thought Reasoning</h5>
+                                </div>
+                                <div class="card-body">
+                `;
+
+                example.step_breakdown.forEach((step, index) => {
+                    const rewardColor = step.reward ? getRewardColor(step.reward) : '#6c757d';
+                    html += `
+                        <div class="card step-card">
+                            <div class="card-header d-flex justify-content-between align-items-center">
+                                <h6 class="mb-0">Step ${step.step_number}</h6>
+                                <div class="d-flex align-items-center">
+                                    <small class="text-muted me-2">${step.word_count} words</small>
+                                    ${step.reward ? `<div class="reward-circle" style="background-color: ${rewardColor}">${step.reward.toFixed(2)}</div>` : ''}
+                                </div>
+                            </div>
+                            <div class="card-body">
+                                <div class="step-content">${step.content}</div>
+                            </div>
+                        </div>
+                    `;
+                });
+
+                html += `
+                                </div>
+                            </div>
+                        </div>
+                        <div class="col-md-4">
+                            <div class="card">
+                                <div class="card-header">
+                                    <h5>Summary Statistics</h5>
+                                </div>
+                                <div class="card-body">
+                                    <p><strong>Total Steps:</strong> ${example.summary.total_steps}</p>
+                                    <p><strong>Total Rewards:</strong> ${example.summary.total_rewards}</p>
+                                    <p><strong>Average Reward:</strong> ${example.summary.avg_reward.toFixed(3)}</p>
+                                    <p><strong>Reward Variance:</strong> ${example.summary.reward_variance.toFixed(3)}</p>
+                                    <p><strong>Total Words:</strong> ${example.summary.total_words}</p>
+                                    <p><strong>Avg Words/Step:</strong> ${example.summary.avg_words_per_step.toFixed(1)}</p>
+                                    <p><strong>Meta Label:</strong> <span class="badge bg-${example.meta_label ? 'success' : 'secondary'}">${example.meta_label}</span></p>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                `;
+
+                container.innerHTML = html;
+            })
+            .catch(error => {
+                document.getElementById('example-detail').innerHTML = 
+                    '<div class="alert alert-danger">Error loading example details.</div>';
+            });
+    </script>
+</body>
+</html>
