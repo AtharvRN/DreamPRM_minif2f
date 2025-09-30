@@ -112,6 +112,10 @@ class PRMDataset(Dataset):
         if len(steps) != self.expected_steps or len(rewards) < self.min_rewards:
             return False
         
+        # Skip examples where all rewards are 0 (poor quality reasoning)
+        if all(reward == 0.0 for reward in rewards[:self.min_rewards]):
+            return False
+        
         # Create the assistant response with step separators
         assistant_response = "<extra_0>".join(steps)
         
