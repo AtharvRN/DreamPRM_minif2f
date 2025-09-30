@@ -40,12 +40,21 @@ class TrainingConfig:
     
     # Model configuration
     max_length: int = 4096
+    use_lora: bool = True
     lora_r: int = 16
     lora_alpha: int = 32
     lora_dropout: float = 0.05
     
-    # System configuration
+    # Multi-GPU configuration
     device: str = "cuda"
+    use_ddp: bool = False
+    local_rank: int = -1
+    world_size: int = 1
+    dist_backend: str = "nccl"
+    ddp_find_unused_parameters: bool = False
+    gradient_accumulation_steps: int = 1
+    
+    # System configuration
     precision: str = "bf16"
     seed: int = 42
     num_workers: int = 0
@@ -178,6 +187,14 @@ def parse_arguments() -> TrainingConfig:
         help="Maximum sequence length"
     )
     model_group.add_argument(
+        "--use_lora", action="store_true", default=True,
+        help="Use LoRA for parameter-efficient fine-tuning"
+    )
+    model_group.add_argument(
+        "--no_lora", dest="use_lora", action="store_false",
+        help="Disable LoRA (full fine-tuning)"
+    )
+    model_group.add_argument(
         "--lora_r", type=int, default=16,
         help="LoRA rank (dimensionality of adaptation)"
     )
@@ -195,6 +212,30 @@ def parse_arguments() -> TrainingConfig:
     system_group.add_argument(
         "--device", type=str, default="cuda",
         help="Device to use (cuda/cpu)"
+    )
+    system_group.add_argument(
+        "--use_ddp", action="store_true",
+        help="Use DistributedDataParallel for multi-GPU training"
+    )
+    system_group.add_argument(
+        "--local_rank", type=int, default=-1,
+        help="Local rank for distributed training"
+    )
+    system_group.add_argument(
+        "--world_size", type=int, default=1,
+        help="Number of GPUs for distributed training"
+    )
+    system_group.add_argument(
+        "--dist_backend", type=str, default="nccl",
+        help="Distributed backend (nccl/gloo)"
+    )
+    system_group.add_argument(
+        "--ddp_find_unused_parameters", action="store_true",
+        help="Find unused parameters in DDP (slower but more robust)"
+    )
+    system_group.add_argument(
+        "--gradient_accumulation_steps", type=int, default=1,
+        help="Gradient accumulation steps for larger effective batch size"
     )
     system_group.add_argument(
         "--precision", type=str, default="bf16",

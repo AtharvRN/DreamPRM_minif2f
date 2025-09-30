@@ -1,7 +1,7 @@
 """Main training logic for DreamPRM bilevel optimization.
 
 This module contains the core training loop for the bilevel optimization
-process in DreamPRM, including inner and outer loop updates.
+process in DreamPRM, including inner and outer loop updates with multi-GPU support.
 """
 
 import logging
@@ -15,6 +15,15 @@ from tqdm import tqdm
 from ..config import TrainingConfig
 from ..models.losses import PRMLossFunction, extract_step_probabilities, compute_aggregate_score
 from .utils import CheckpointManager, MetricsTracker
+from .distributed import (
+    wrap_model_for_distributed,
+    create_distributed_dataloader,
+    is_main_process,
+    barrier,
+    reduce_metrics,
+    save_checkpoint_distributed,
+    load_checkpoint_distributed
+)
 
 logger = logging.getLogger(__name__)
 
@@ -44,14 +53,33 @@ class BilevelTrainer:
             step_separator_id: Token ID for step separators
         """
         self.config = config
-        self.model = model
-        self.train_loader = train_loader
-        self.meta_loader = meta_loader
         self.step_separator_id = step_separator_id
         
         # Setup device
-        self.device = torch.device(config.device)
-        self.model.to(self.device)
+        if config.use_ddp:
+            self.device = torch.device(f"cuda:{config.local_rank}")
+        else:
+            self.device = torch.device(config.device)
+        
+        # Move model to device and wrap for distributed training if needed
+        model = model.to(self.device)
+        if config.use_ddp:
+            self.model = wrap_model_for_distributed(
+                model, 
+                find_unused_parameters=config.ddp_find_unused_parameters
+            )
+        else:
+            self.model = model
+        
+        # Store original data loaders or create distributed ones
+        if config.use_ddp:
+            # Recreate with distributed samplers - this should be done in create_data_loaders
+            # but we handle it here in case it wasn't
+            self.train_loader = train_loader
+            self.meta_loader = meta_loader
+        else:
+            self.train_loader = train_loader
+            self.meta_loader = meta_loader
         
         # Initialize loss function
         self.loss_fn = PRMLossFunction()
@@ -73,7 +101,12 @@ class BilevelTrainer:
             config.model_name, trust_remote_code=True
         )
         
-        logger.info("BilevelTrainer initialized")
+        # Gradient accumulation state
+        self.accumulated_loss = 0.0
+        self.accumulation_steps = 0
+        
+        if is_main_process():
+            logger.info("BilevelTrainer initialized")
     
     def _setup_optimizers(self) -> None:
         """Setup optimizers and learning rate schedulers."""
@@ -110,46 +143,66 @@ class BilevelTrainer:
     
     def train(self) -> None:
         """Execute the main training loop."""
-        logger.info("Starting bilevel training...")
+        if is_main_process():
+            logger.info("Starting bilevel training...")
         
         # Resume from checkpoint if specified
         start_step = self._maybe_resume_training()
         
         # Training loop
         self.model.train()
-        progress_bar = tqdm(
-            range(start_step, self.config.total_steps),
-            desc="Training",
-            initial=start_step,
-            total=self.config.total_steps
-        )
+        
+        # Setup progress bar only on main process
+        if is_main_process():
+            progress_bar = tqdm(
+                range(start_step, self.config.total_steps),
+                desc="Training",
+                initial=start_step,
+                total=self.config.total_steps
+            )
+        else:
+            progress_bar = range(start_step, self.config.total_steps)
         
         try:
             for step in progress_bar:
+                # Set epoch for distributed sampler
+                if self.config.use_ddp and hasattr(self.train_loader.sampler, 'set_epoch'):
+                    self.train_loader.sampler.set_epoch(step)
+                
                 step_metrics = self._training_step(step)
                 
-                # Update progress bar
-                progress_bar.set_postfix({
-                    'inner_loss': step_metrics.get('inner_loss', 0),
-                    'meta_loss': step_metrics.get('meta_loss', 0)
-                })
+                # Reduce metrics across processes
+                if self.config.use_ddp:
+                    step_metrics = reduce_metrics(step_metrics)
                 
-                # Logging
-                if step % self.config.log_every_steps == 0:
+                # Update progress bar (main process only)
+                if is_main_process() and hasattr(progress_bar, 'set_postfix'):
+                    progress_bar.set_postfix({
+                        'inner_loss': step_metrics.get('inner_loss', 0),
+                        'meta_loss': step_metrics.get('meta_loss', 0)
+                    })
+                
+                # Logging (main process only)
+                if is_main_process() and step % self.config.log_every_steps == 0:
                     self._log_step_metrics(step, step_metrics)
                 
-                # Save checkpoint
+                # Save checkpoint (main process only)
                 if step % self.config.save_every_steps == 0 and step > 0:
-                    self._save_checkpoint(step, step_metrics)
+                    if self.config.use_ddp:
+                        barrier()  # Synchronize before saving
+                    if is_main_process():
+                        self._save_checkpoint(step, step_metrics)
                 
                 # Memory cleanup
                 if step % 100 == 0:
                     torch.cuda.empty_cache()
         
         except KeyboardInterrupt:
-            logger.info("Training interrupted by user")
+            if is_main_process():
+                logger.info("Training interrupted by user")
         except Exception as e:
-            logger.error(f"Training failed with error: {e}")
+            if is_main_process():
+                logger.error(f"Training failed with error: {e}")
             if self.config.debug:
                 raise
         finally:

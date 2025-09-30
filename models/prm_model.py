@@ -16,28 +16,30 @@ logger = logging.getLogger(__name__)
 def build_prm_model(
     model_name: str,
     use_bf16: bool = True,
+    use_lora: bool = True,
     lora_r: int = 16,
     lora_alpha: int = 32,
     lora_dropout: float = 0.05,
     device_map: str = "auto"
 ) -> PreTrainedModel:
-    """Build a Process Reward Model with LoRA fine-tuning.
+    """Build a Process Reward Model with optional LoRA fine-tuning.
     
     Args:
         model_name: HuggingFace model name/path
         use_bf16: Whether to use bfloat16 precision
+        use_lora: Whether to use LoRA for parameter-efficient fine-tuning
         lora_r: LoRA rank (dimensionality of adaptation)
         lora_alpha: LoRA alpha scaling parameter
         lora_dropout: LoRA dropout rate
         device_map: Device mapping strategy for model loading
         
     Returns:
-        PeftModel: Model with LoRA adapters attached
+        PreTrainedModel or PeftModel: Model with optional LoRA adapters
         
     Raises:
         ValueError: If model loading or LoRA configuration fails
     """
-    logger.info(f"Building PRM model from {model_name}")
+    logger.info(f"Building PRM model from {model_name} (LoRA: {use_lora})")
     
     # Determine precision
     dtype = torch.bfloat16 if use_bf16 else torch.float16
@@ -55,18 +57,24 @@ def build_prm_model(
         # Configure model for training
         _configure_model_for_training(base_model)
         
-        # Set up LoRA configuration
-        lora_config = _create_lora_config(
-            lora_r, lora_alpha, lora_dropout
-        )
-        
-        # Apply LoRA to the model
-        peft_model = get_peft_model(base_model, lora_config)
+        if use_lora:
+            # Set up LoRA configuration
+            lora_config = _create_lora_config(
+                lora_r, lora_alpha, lora_dropout
+            )
+            
+            # Apply LoRA to the model
+            model = get_peft_model(base_model, lora_config)
+            logger.info("LoRA adapters applied successfully")
+        else:
+            # Use full fine-tuning
+            model = base_model
+            logger.info("Using full fine-tuning (no LoRA)")
         
         # Log model information
-        _log_model_info(peft_model)
+        _log_model_info(model)
         
-        return peft_model
+        return model
         
     except Exception as e:
         raise ValueError(f"Failed to build PRM model: {e}") from e
