@@ -1,0 +1,28 @@
+# Core ML/AI Dependencies
+torch>=2.0.0
+transformers>=4.30.0
+peft>=0.4.0
+accelerate>=0.20.0
+
+# Data Processing
+numpy>=1.21.0
+datasets>=2.10.0
+
+# Experiment Tracking & Visualization
+wandb>=0.15.0
+tqdm>=4.64.0
+
+# Development & Testing
+pytest>=7.0.0
+black>=23.0.0
+isort>=5.12.0
+mypy>=1.0.0
+
+# Optional: For Jupyter notebooks (if needed)
+jupyter>=1.0.0
+ipython>=8.0.0
+
+# Optional: For advanced metrics
+scikit-learn>=1.0.0
+matplotlib>=3.5.0
+seaborn>=0.11.0
