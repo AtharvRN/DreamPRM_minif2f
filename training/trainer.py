@@ -9,13 +9,14 @@ from typing import Optional, Dict, Any
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from transformers import AdamW, get_cosine_schedule_with_warmup, AutoTokenizer
+from torch.optim import AdamW
+from transformers import get_cosine_schedule_with_warmup, AutoTokenizer
 from tqdm import tqdm
 
-from ..config import TrainingConfig
-from ..models.losses import PRMLossFunction, extract_step_probabilities, compute_aggregate_score
-from .utils import CheckpointManager, MetricsTracker
-from .distributed import (
+from config import TrainingConfig
+from models.losses import PRMLossFunction, extract_step_probabilities, compute_aggregate_score
+from training.utils import CheckpointManager, MetricsTracker
+from training.distributed import (
     wrap_model_for_distributed,
     create_distributed_dataloader,
     is_main_process,
@@ -55,21 +56,45 @@ class BilevelTrainer:
         self.config = config
         self.step_separator_id = step_separator_id
         
+        # Check if model is already distributed with device_map
+        self.model_is_distributed = hasattr(model, 'hf_device_map') and model.hf_device_map is not None
+        
         # Setup device
         if config.use_ddp:
             self.device = torch.device(f"cuda:{config.local_rank}")
         else:
             self.device = torch.device(config.device)
+            # Ensure we're using the specified device
+            if "cuda" in config.device and torch.cuda.is_available():
+                torch.cuda.set_device(self.device)
         
-        # Move model to device and wrap for distributed training if needed
-        model = model.to(self.device)
-        if config.use_ddp:
-            self.model = wrap_model_for_distributed(
-                model, 
-                find_unused_parameters=config.ddp_find_unused_parameters
-            )
-        else:
+        # Handle model device placement
+        if self.model_is_distributed:
+            # Model is already distributed with device_map, don't move it
+            logger.info(f"Model is pre-distributed with device_map: {model.hf_device_map}")
             self.model = model
+            
+            # CRITICAL: Ensure training mode and gradients after device mapping
+            self.model.train()
+            for name, param in self.model.named_parameters():
+                param.requires_grad = True
+            logger.info("Forced training mode and gradients for distributed model")
+        else:
+            # Move model to device and wrap for distributed training if needed
+            model = model.to(self.device)
+            
+            # For multi-GPU without device_map, use DataParallel
+            if torch.cuda.device_count() > 1 and not config.use_ddp:
+                logger.info(f"Using DataParallel across {torch.cuda.device_count()} GPUs")
+                model = torch.nn.DataParallel(model)
+                
+            if config.use_ddp:
+                self.model = wrap_model_for_distributed(
+                    model, 
+                    find_unused_parameters=config.ddp_find_unused_parameters
+                )
+            else:
+                self.model = model
         
         # Store original data loaders or create distributed ones
         if config.use_ddp:
@@ -85,9 +110,16 @@ class BilevelTrainer:
         self.loss_fn = PRMLossFunction()
         
         # Initialize instance weights
-        self.instance_weights = nn.Parameter(
-            torch.ones(len(train_loader.dataset), device=self.device, requires_grad=True)
-        )
+        if self.model_is_distributed:
+            # For distributed models, put instance weights on the first available GPU
+            first_device = f"cuda:{min(model.hf_device_map.values())}"
+            self.instance_weights = nn.Parameter(
+                torch.ones(len(train_loader.dataset), device=first_device, requires_grad=True)
+            )
+        else:
+            self.instance_weights = nn.Parameter(
+                torch.ones(len(train_loader.dataset), device=self.device, requires_grad=True)
+            )
         
         # Setup optimizers
         self._setup_optimizers()
@@ -107,6 +139,45 @@ class BilevelTrainer:
         
         if is_main_process():
             logger.info("BilevelTrainer initialized")
+            
+        # Log detailed parameter information
+        self._log_parameter_details()
+    
+    def _log_parameter_details(self):
+        """Log detailed information about model parameters and memory usage."""
+        if not is_main_process():
+            return
+            
+        total_params = 0
+        trainable_params = 0
+        frozen_params = 0
+        
+        for name, param in self.model.named_parameters():
+            param_count = param.numel()
+            total_params += param_count
+            
+            if param.requires_grad:
+                trainable_params += param_count
+            else:
+                frozen_params += param_count
+        
+        logger.info(f"=== Parameter Analysis ===")
+        logger.info(f"Total parameters: {total_params:,}")
+        logger.info(f"Trainable parameters: {trainable_params:,}")
+        logger.info(f"Frozen parameters: {frozen_params:,}")
+        logger.info(f"Trainable percentage: {100 * trainable_params / total_params:.2f}%")
+        
+        # Log instance weights info
+        logger.info(f"Instance weights: {self.instance_weights.numel():,} parameters")
+        logger.info(f"Instance weights device: {self.instance_weights.device}")
+        logger.info(f"Instance weights requires_grad: {self.instance_weights.requires_grad}")
+        
+        # Log memory info if CUDA is available
+        if torch.cuda.is_available():
+            for i in range(torch.cuda.device_count()):
+                allocated = torch.cuda.memory_allocated(i) / 1024**3
+                reserved = torch.cuda.memory_reserved(i) / 1024**3
+                logger.info(f"GPU {i} - Allocated: {allocated:.2f} GB, Reserved: {reserved:.2f} GB")
     
     def _setup_optimizers(self) -> None:
         """Setup optimizers and learning rate schedulers."""
@@ -241,6 +312,12 @@ class BilevelTrainer:
         Returns:
             Average inner loss or None if no valid batches
         """
+        self.model.train()  # Ensure training mode
+        
+        # Force all parameters to require gradients
+        for param in self.model.parameters():
+            param.requires_grad = True
+        
         inner_losses = []
         
         for inner_step in range(self.config.inner_steps):
@@ -267,12 +344,43 @@ class BilevelTrainer:
         Returns:
             Batch loss or None if processing failed
         """
-        # Move batch to device
-        input_ids = batch["input_ids"].to(self.device)
-        attention_mask = batch["attention_mask"].to(self.device)
+        # Handle device placement based on model distribution
+        if self.model_is_distributed:
+            # For distributed models, we need to move inputs to the device of the embedding layer
+            # The embedding layer is typically on the first device in the device map
+            embed_device = None
+            for name, device_id in self.model.hf_device_map.items():
+                if 'embed_tokens' in name:
+                    embed_device = f"cuda:{device_id}"
+                    break
+            
+            if embed_device is None:
+                # Fallback to first device in map
+                embed_device = f"cuda:{min(self.model.hf_device_map.values())}"
+            
+            input_ids = batch["input_ids"].to(embed_device, non_blocking=True)
+            attention_mask = batch["attention_mask"].to(embed_device, non_blocking=True)
+        else:
+            # For single-device models, move tensors to the model device
+            input_ids = batch["input_ids"].to(self.device, non_blocking=True)
+            attention_mask = batch["attention_mask"].to(self.device, non_blocking=True)
+        
+        rewards_list = batch["rewards_list"]
+        idxs = batch["idxs"]
+        
+        # Ensure model is in training mode and gradients are enabled
+        self.model.train()
+        if self.model_is_distributed:
+            for param in self.model.parameters():
+                param.requires_grad = True
         
         # Forward pass
         outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
+        
+        # Re-enable gradients after forward pass for distributed models
+        if self.model_is_distributed:
+            for param in self.model.parameters():
+                param.requires_grad = True
         
         # Extract step probabilities
         step_probs = extract_step_probabilities(
@@ -285,7 +393,7 @@ class BilevelTrainer:
         
         # Compute step-wise loss
         step_loss = self.loss_fn.compute_step_loss(
-            step_probs, batch["rewards_list"], self.device
+            step_probs, rewards_list, self.device if not self.model_is_distributed else None
         )
         
         if step_loss.item() == 0:
@@ -295,12 +403,36 @@ class BilevelTrainer:
         if self.config.baseline:
             loss = step_loss
         else:
-            weights = self.instance_weights[batch["idxs"].to(self.device)]
+            if self.model_is_distributed:
+                # Move idxs to the same device as instance weights
+                weights_device = self.instance_weights.device
+                weights = self.instance_weights[idxs.to(weights_device, non_blocking=True)]
+                # Move weights to the same device as step_loss
+                weights = weights.to(step_loss.device)
+            else:
+                weights = self.instance_weights[idxs.to(self.device, non_blocking=True)]
             loss = (weights * step_loss).mean()
         
         # Backward pass
         self.optimizer_inner.zero_grad()
+        
+        # For device_map models, ensure all model parameters have gradients enabled
+        if self.model_is_distributed:
+            for param in self.model.parameters():
+                if param.requires_grad:
+                    param.retain_grad()
+        
         loss.backward()
+        
+        # Log instance weights periodically
+        if hasattr(self, '_step_count'):
+            self._step_count += 1
+        else:
+            self._step_count = 1
+            
+        if self._step_count % 50 == 1 and is_main_process():  # Log every 20 batches
+            logger.info(f"Instance weights (step {self._step_count}): {self.instance_weights.data}")
+            self._log_gradient_info()
         
         # Gradient clipping
         torch.nn.utils.clip_grad_norm_(
@@ -312,6 +444,21 @@ class BilevelTrainer:
         self.scheduler_inner.step()
         
         return loss.item()
+    
+    def _log_gradient_info(self):
+        """Log essential gradient information."""
+        if not is_main_process():
+            return
+            
+        params_with_grad = sum(1 for p in self.model.parameters() if p.grad is not None)
+        total_params = sum(1 for p in self.model.parameters())
+        
+        # logger.info(f"Gradients: {params_with_grad}/{total_params} parameters updated")
+        
+        # Log instance weights gradient
+        if self.instance_weights.grad is not None:
+            inst_grad_norm = self.instance_weights.grad.data.norm(2).item()
+            # logger.info(f"Instance weights gradient norm: {inst_grad_norm:.6f}")
     
     def _outer_loop_update(self) -> Dict[str, float]:
         """Execute outer loop update (update instance weights).
@@ -353,7 +500,11 @@ class BilevelTrainer:
             if not self.config.dry_run:
                 self._update_instance_weights(meta_loss_mean)
         
+        # Restore training mode and gradients after outer loop
         self.model.train()
+        for param in self.model.parameters():
+            param.requires_grad = True
+        
         return metrics
     
     def _process_meta_batch(self, batch: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -365,12 +516,34 @@ class BilevelTrainer:
         Returns:
             Dictionary with loss and scores or None if processing failed
         """
-        # Move batch to device
-        input_ids = batch["input_ids"].to(self.device)
-        attention_mask = batch["attention_mask"].to(self.device)
+        # Handle device placement based on model distribution
+        if self.model_is_distributed:
+            # For distributed models, move to embedding device
+            embed_device = None
+            for name, device_id in self.model.hf_device_map.items():
+                if 'embed_tokens' in name:
+                    embed_device = f"cuda:{device_id}"
+                    break
+            
+            if embed_device is None:
+                # Fallback to first device in map
+                embed_device = f"cuda:{min(self.model.hf_device_map.values())}"
+            
+            input_ids = batch["input_ids"].to(embed_device, non_blocking=True)
+            attention_mask = batch["attention_mask"].to(embed_device, non_blocking=True)
+            meta_labels = batch["meta_labels"].to(embed_device, non_blocking=True)
+        else:
+            # For single-device models, move tensors to the model device
+            input_ids = batch["input_ids"].to(self.device, non_blocking=True)
+            attention_mask = batch["attention_mask"].to(self.device, non_blocking=True)
+            meta_labels = batch["meta_labels"].to(self.device, non_blocking=True)
         
         # Forward pass
         outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
+        
+        # CRITICAL: For device_map models, ensure output tensors require gradients
+        if self.model_is_distributed and hasattr(outputs, 'logits'):
+            outputs.logits.requires_grad_(True)
         
         # Extract step probabilities
         step_probs = extract_step_probabilities(
@@ -389,7 +562,11 @@ class BilevelTrainer:
         
         # Compute meta loss
         aggregate_tensor = torch.stack(aggregate_scores_list)
-        meta_labels = batch["meta_labels"].to(self.device)
+        
+        # Ensure meta_labels is on the same device as aggregate_tensor
+        if self.model_is_distributed:
+            meta_labels = meta_labels.to(aggregate_tensor.device)
+        
         meta_loss = self.loss_fn.compute_meta_loss(aggregate_tensor, meta_labels)
         
         return {

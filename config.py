@@ -187,7 +187,7 @@ def parse_arguments() -> TrainingConfig:
         help="Maximum sequence length"
     )
     model_group.add_argument(
-        "--use_lora", action="store_true", default=True,
+        "--use_lora", action="store_true",
         help="Use LoRA for parameter-efficient fine-tuning"
     )
     model_group.add_argument(
@@ -296,6 +296,9 @@ def parse_arguments() -> TrainingConfig:
         "--baseline", action="store_true",
         help="Run baseline without bilevel optimization"
     )
+    
+    # Set defaults for boolean flags
+    parser.set_defaults(use_lora=True)
     
     args = parser.parse_args()
     

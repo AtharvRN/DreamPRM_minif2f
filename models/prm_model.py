@@ -7,7 +7,7 @@ Process Reward Models with LoRA fine-tuning.
 import logging
 from typing import Optional
 import torch
-from transformers import AutoModel, PreTrainedModel
+from transformers import AutoModel, AutoModelForSequenceClassification, PreTrainedModel
 from peft import LoraConfig, get_peft_model
 
 logger = logging.getLogger(__name__)
@@ -20,7 +20,7 @@ def build_prm_model(
     lora_r: int = 16,
     lora_alpha: int = 32,
     lora_dropout: float = 0.05,
-    device_map: str = "auto"
+    device_map: Optional[str] = "auto"
 ) -> PreTrainedModel:
     """Build a Process Reward Model with optional LoRA fine-tuning.
     
@@ -46,16 +46,34 @@ def build_prm_model(
     logger.info(f"Using precision: {dtype}")
     
     try:
-        # Load base model
+        # Load base model using official approach
+        model_kwargs = {
+            "trust_remote_code": True,
+            "torch_dtype": dtype,
+            "device_map": device_map,  # Use device_map (default "auto" for multi-GPU)
+        }
+        
+        # Load the model directly with AutoModel (official approach)
         base_model = AutoModel.from_pretrained(
             model_name,
-            trust_remote_code=True,
-            torch_dtype=dtype,
-            device_map=device_map
+            **model_kwargs
         )
+        logger.info(f"Loaded model type: {type(base_model).__name__}")
+        
+        # Log device mapping if available
+        if hasattr(base_model, 'hf_device_map'):
+            logger.info(f"Model device map: {base_model.hf_device_map}")
+        else:
+            logger.info("No device mapping information available")
         
         # Configure model for training
         _configure_model_for_training(base_model)
+        
+        # Ensure model is in training mode and parameters require gradients
+        base_model.train()
+        for param in base_model.parameters():
+            param.requires_grad = True
+        logger.info("Ensured all model parameters require gradients")
         
         if use_lora:
             # Set up LoRA configuration
@@ -70,6 +88,9 @@ def build_prm_model(
             # Use full fine-tuning
             model = base_model
             logger.info("Using full fine-tuning (no LoRA)")
+            
+            # For full fine-tuning without device_map, we'll handle multi-GPU in trainer
+            logger.info("Model will use PyTorch native multi-GPU support")
         
         # Log model information
         _log_model_info(model)

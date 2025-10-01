@@ -10,7 +10,7 @@ Usage:
 Examples:
     # Basic training
     python main.py --train_json_file data/train.jsonl --meta_json_file data/meta.jsonl
-    
+
     # Training with custom configuration
     python main.py --model_name Qwen/Qwen2.5-Math-PRM-7B --lr 1e-4 --total_steps 5000
     
@@ -30,18 +30,18 @@ from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 
 # Import our modular components
-from .config import parse_arguments, TrainingConfig
-from .data import PRMDataset, DataCollatorPRM
-from .models import build_prm_model
-from .training import BilevelTrainer
-from .training.distributed import (
+from config import parse_arguments, TrainingConfig
+from data import PRMDataset, DataCollatorPRM
+from models import build_prm_model
+from training import BilevelTrainer
+from training.distributed import (
     setup_distributed_training, 
     cleanup_distributed_training,
     is_main_process,
     get_rank,
     get_world_size
 )
-from .utils import setup_logging, set_random_seed, get_device, check_precision_support
+from utils import setup_logging, set_random_seed, get_device, check_precision_support
 
 logger = logging.getLogger(__name__)
 
@@ -180,7 +180,7 @@ def create_data_loaders(
     collator = DataCollatorPRM(tokenizer.pad_token_id)
     
     # Import distributed utilities
-    from .training.distributed import create_distributed_dataloader
+    from training.distributed import create_distributed_dataloader
     
     # Create data loaders with distributed support
     train_loader = create_distributed_dataloader(
@@ -278,6 +278,11 @@ def main() -> int:
         device = get_device(config.device)
         if is_distributed:
             device = torch.device(f"cuda:{rank}")
+        else:
+            # Force to use only GPU 0 to avoid multi-GPU conflicts
+            if torch.cuda.is_available() and config.device == "cuda":
+                device = torch.device("cuda:0")
+                torch.cuda.set_device(0)
         config.precision = check_precision_support(config.precision)
         config.device = str(device)
         

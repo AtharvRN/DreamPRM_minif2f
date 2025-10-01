@@ -10,7 +10,7 @@ import torch
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizer
 
-from .processing import (
+from data.processing import (
     read_jsonl,
     extract_steps_from_cot_response,
     extract_rewards_from_cot_steps
